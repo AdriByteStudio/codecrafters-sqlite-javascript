@@ -228,13 +228,13 @@ function readRowsFromTable(databaseFileBuffer, rootPageNumber) {
 }
 
 function selectFromTable(databaseFileBuffer, query) {
-  const match = query.match(/^SELECT\s+([A-Za-z_][\w\"]*)\s+FROM\s+([A-Za-z_][\w\".`]*)$/i);
+  const match = query.match(/^SELECT\s+(.+)\s+FROM\s+([A-Za-z_][\w".`]*)$/i);
 
   if (!match) {
     throw new Error(`Unsupported query ${query}`);
   }
 
-  const [, columnName, tableName] = match;
+  const [, columnList, tableName] = match;
   const tableSchema = getTableSchema(databaseFileBuffer, tableName);
 
   if (!tableSchema) {
@@ -242,14 +242,23 @@ function selectFromTable(databaseFileBuffer, query) {
   }
 
   const columnNames = parseCreateTableColumns(tableSchema.sql);
-  const columnIndex = columnNames.findIndex((name) => name.toLowerCase() === columnName.toLowerCase());
+  const requestedColumns = columnList
+    .split(",")
+    .map((columnName) => columnName.trim())
+    .filter(Boolean);
 
-  if (columnIndex === -1) {
-    throw new Error(`Unknown column ${columnName}`);
-  }
+  const columnIndexes = requestedColumns.map((columnName) => {
+    const columnIndex = columnNames.findIndex((name) => name.toLowerCase() === columnName.toLowerCase());
+
+    if (columnIndex === -1) {
+      throw new Error(`Unknown column ${columnName}`);
+    }
+
+    return columnIndex;
+  });
 
   const rows = readRowsFromTable(databaseFileBuffer, tableSchema.rootPageNumber);
-  return rows.map((row) => row[columnIndex]);
+  return rows.map((row) => columnIndexes.map((columnIndex) => row[columnIndex]).join("|"));
 }
 
 if (command === ".dbinfo") {
