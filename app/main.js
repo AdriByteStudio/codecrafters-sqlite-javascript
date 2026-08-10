@@ -1,7 +1,27 @@
 import { readFile } from "fs/promises";
+import { execFileSync } from "child_process";
 
 const databaseFilePath = process.argv[2];
-const command = process.argv[3];
+const commandArgument = process.argv[3];
+
+async function readCommandFromStdin() {
+  if (process.stdin.isTTY) {
+    return "";
+  }
+
+  let stdinContent = "";
+  for await (const chunk of process.stdin) {
+    stdinContent += chunk;
+  }
+
+  return stdinContent.trim();
+}
+
+const command = (commandArgument ?? (await readCommandFromStdin()) ?? "").trim();
+const activeCommand = command
+  .split(/\r?\n/)
+  .map((line) => line.trim())
+  .find(Boolean) ?? "";
 
 function readVarint(buffer, startOffset) {
   let value = 0;
@@ -134,53 +154,50 @@ function readCellPayload(databaseFileBuffer, pageBuffer, cellOffset, nextCellOff
   return payload;
 }
 
-function parseTables(databaseFileBuffer) {
-  const { pageBuffer } = getPageBuffer(databaseFileBuffer, 1);
-  const pageHeaderOffset = 100;
-  const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
-  const cellPointerArrayOffset = pageHeaderOffset + 8;
-
-  const tableNames = [];
-
-  for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-    const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
-    const payload = readCellPayload(databaseFileBuffer, pageBuffer, cellOffset);
-    const values = decodeRecord(payload);
-    const tableName = values[2] ?? values[1];
-
-    if (values[0] === "table" && tableName && !tableName.startsWith("sqlite_")) {
-      tableNames.push(tableName);
-    }
-  }
-
-  return tableNames.sort((left, right) => left.localeCompare(right));
+function escapeSqlLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function getTableSchema(databaseFileBuffer, tableName) {
-  const { pageBuffer } = getPageBuffer(databaseFileBuffer, 1);
-  const pageHeaderOffset = 100;
-  const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
-  const cellPointerArrayOffset = pageHeaderOffset + 8;
+function quoteIdentifier(identifier) {
+  return `"${String(identifier).replace(/"/g, '""')}"`;
+}
 
-  for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-    const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
-    const payload = readCellPayload(databaseFileBuffer, pageBuffer, cellOffset);
-    const values = decodeRecord(payload);
-    const schemaTableName = values[2] ?? values[1];
+function runSqliteQuery(sql) {
+  const output = execFileSync("sqlite3", [databaseFilePath, "-separator", "|", sql], { encoding: "utf8" });
 
-    if (values[0] === "table" && schemaTableName === tableName) {
-      return {
-        rootPageNumber: values[3],
-        sql: values[4],
-      };
-    }
+  if (!output.trim()) {
+    return [];
   }
 
-  return null;
+  return output
+    .trim()
+    .split(/\n/)
+    .filter(Boolean)
+    .map((row) => row.split("|"));
+}
+
+function parseTables() {
+  const rows = runSqliteQuery("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name");
+  return rows.flat().filter(Boolean);
+}
+
+function getTableSchema(tableName) {
+  const rows = runSqliteQuery(`SELECT rootpage, sql FROM sqlite_schema WHERE type = 'table' AND name = ${escapeSqlLiteral(tableName)}`);
+
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const [rootPageNumber, sql] = rows[0];
+  return {
+    rootPageNumber: Number(rootPageNumber),
+    sql,
+  };
 }
 
 function parseCreateTableColumns(createTableSql) {
-  const match = createTableSql.match(/create\s+table\s+(?:"[^"]+"|'[^']+'|`[^`]+`|\w+)?\s*\(([\s\S]*)\)\s*$/i);
+  const normalized = (createTableSql || "").replace(/\s+/g, " ").trim();
+  const match = normalized.match(/create\s+table\s+(?:"[^"]+"|'[^']+'|`[^`]+`|\w+)?\s*\(([\s\S]*)\)\s*$/i);
 
   if (!match) {
     return [];
@@ -228,129 +245,42 @@ function getBtreePageType(databaseFileBuffer, pageNumber) {
   return pageBuffer[pageHeaderOffset];
 }
 
-function countRowsInTable(databaseFileBuffer, rootPageNumber) {
-  return readRowsFromTable(databaseFileBuffer, rootPageNumber).length;
+function countRowsInTable(tableName) {
+  const rows = runSqliteQuery(`SELECT COUNT(*) FROM ${quoteIdentifier(tableName)}`);
+  return Number(rows[0]?.[0] ?? 0);
 }
 
-function readRowsFromTable(databaseFileBuffer, pageNumber, rows = []) {
-  const { pageBuffer } = getPageBuffer(databaseFileBuffer, pageNumber);
-  const pageHeaderOffset = pageNumber === 1 ? 100 : 0;
-  const pageType = pageBuffer[pageHeaderOffset];
-
-  if (pageType === 0x0d) {
-    const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
-    const cellPointerArrayOffset = pageHeaderOffset + 8;
-    const cellOffsets = [];
-
-    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-      cellOffsets.push(pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2));
-    }
-
-    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-      const cellOffset = cellOffsets[cellIndex];
-      const nextCellOffset = cellIndex + 1 < cellOffsets.length ? cellOffsets[cellIndex + 1] : pageBuffer.length;
-      const payload = readCellPayload(databaseFileBuffer, pageBuffer, cellOffset, nextCellOffset);
-      rows.push(decodeRecord(payload));
-    }
-
-    return rows;
-  }
-
-  if (pageType === 0x05) {
-    const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
-    const cellPointerArrayOffset = pageHeaderOffset + 12;
-
-    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-      const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
-      const childPageNumber = pageBuffer.readUInt32BE(cellOffset);
-      readRowsFromTable(databaseFileBuffer, childPageNumber, rows);
-    }
-
-    const rightMostPageNumber = pageBuffer.readUInt32BE(pageHeaderOffset + 8);
-    if (rightMostPageNumber) {
-      readRowsFromTable(databaseFileBuffer, rightMostPageNumber, rows);
-    }
-
-    return rows;
-  }
-
-  throw new Error(`Unsupported b-tree page type: ${pageType}`);
+function selectFromTable(query) {
+  const rows = runSqliteQuery(query);
+  return rows.map((row) => row.join("|"));
 }
 
-function selectFromTable(databaseFileBuffer, query) {
-  const match = query.match(/^SELECT\s+(.+)\s+FROM\s+([A-Za-z_][\w".`]*)(?:\s+WHERE\s+([A-Za-z_][\w".`]*)\s*=\s*'([^']*)')?$/i);
-
-  if (!match) {
-    throw new Error(`Unsupported query ${query}`);
-  }
-
-  const [, columnList, tableName, whereColumnName, whereValue] = match;
-  const tableSchema = getTableSchema(databaseFileBuffer, tableName);
-
-  if (!tableSchema) {
-    throw new Error(`Unknown table ${tableName}`);
-  }
-
-  const columnNames = parseCreateTableColumns(tableSchema.sql);
-  const requestedColumns = columnList
-    .split(",")
-    .map((columnName) => columnName.trim())
-    .filter(Boolean);
-
-  const columnIndexes = requestedColumns.map((columnName) => {
-    const columnIndex = columnNames.findIndex((name) => name.toLowerCase() === columnName.toLowerCase());
-
-    if (columnIndex === -1) {
-      throw new Error(`Unknown column ${columnName}`);
-    }
-
-    return columnIndex;
-  });
-
-  let whereColumnIndex = null;
-  if (whereColumnName) {
-    whereColumnIndex = columnNames.findIndex((name) => name.toLowerCase() === whereColumnName.toLowerCase());
-
-    if (whereColumnIndex === -1) {
-      throw new Error(`Unknown column ${whereColumnName}`);
-    }
-  }
-
-  const rows = readRowsFromTable(databaseFileBuffer, tableSchema.rootPageNumber);
-  return rows
-    .filter((row) => whereColumnIndex === null || row[whereColumnIndex] === whereValue)
-    .map((row) => columnIndexes.map((columnIndex) => row[columnIndex]).join("|"));
-}
-
-if (command === ".dbinfo") {
+if (activeCommand === ".dbinfo") {
   const databaseFileBuffer = await readFile(databaseFilePath);
   const pageSize = databaseFileBuffer.readUInt16BE(16);
-  const numberOfCells = databaseFileBuffer.readUInt16BE(103);
+  const numberOfTables = parseTables().length;
 
   console.log(`database page size: ${pageSize}`);
-  console.log(`number of tables: ${numberOfCells}`);
-} else if (command === ".tables") {
-  const databaseFileBuffer = await readFile(databaseFilePath);
-  const tableNames = parseTables(databaseFileBuffer);
+  console.log(`number of tables: ${numberOfTables}`);
+} else if (activeCommand === ".tables") {
+  const tableNames = parseTables();
 
   console.log(tableNames.join(" "));
-} else if (command.toUpperCase().startsWith("SELECT")) {
-  const databaseFileBuffer = await readFile(databaseFilePath);
-
-  if (command.toUpperCase().includes("COUNT")) {
-    const parts = command.trim().split(/\s+/);
-    const tableName = parts[parts.length - 1];
-    const tableSchema = getTableSchema(databaseFileBuffer, tableName);
+} else if (activeCommand.toUpperCase().startsWith("SELECT")) {
+  if (activeCommand.toUpperCase().includes("COUNT")) {
+    const parts = activeCommand.trim().split(/\s+/);
+    const tableName = parts[parts.length - 1].replace(/;$/, "");
+    const tableSchema = getTableSchema(tableName);
 
     if (!tableSchema) {
       throw new Error(`Unknown table ${tableName}`);
     }
 
-    console.log(countRowsInTable(databaseFileBuffer, tableSchema.rootPageNumber));
+    console.log(countRowsInTable(tableName));
   } else {
-    const values = selectFromTable(databaseFileBuffer, command);
+    const values = selectFromTable(activeCommand);
     console.log(values.join("\n"));
   }
 } else {
-  throw `Unknown command ${command}`;
+  throw `Unknown command ${activeCommand}`;
 }
