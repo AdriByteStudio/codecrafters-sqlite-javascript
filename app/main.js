@@ -228,13 +228,13 @@ function readRowsFromTable(databaseFileBuffer, rootPageNumber) {
 }
 
 function selectFromTable(databaseFileBuffer, query) {
-  const match = query.match(/^SELECT\s+(.+)\s+FROM\s+([A-Za-z_][\w".`]*)$/i);
+  const match = query.match(/^SELECT\s+(.+)\s+FROM\s+([A-Za-z_][\w".`]*)(?:\s+WHERE\s+([A-Za-z_][\w".`]*)\s*=\s*'([^']*)')?$/i);
 
   if (!match) {
     throw new Error(`Unsupported query ${query}`);
   }
 
-  const [, columnList, tableName] = match;
+  const [, columnList, tableName, whereColumnName, whereValue] = match;
   const tableSchema = getTableSchema(databaseFileBuffer, tableName);
 
   if (!tableSchema) {
@@ -257,8 +257,19 @@ function selectFromTable(databaseFileBuffer, query) {
     return columnIndex;
   });
 
+  let whereColumnIndex = null;
+  if (whereColumnName) {
+    whereColumnIndex = columnNames.findIndex((name) => name.toLowerCase() === whereColumnName.toLowerCase());
+
+    if (whereColumnIndex === -1) {
+      throw new Error(`Unknown column ${whereColumnName}`);
+    }
+  }
+
   const rows = readRowsFromTable(databaseFileBuffer, tableSchema.rootPageNumber);
-  return rows.map((row) => columnIndexes.map((columnIndex) => row[columnIndex]).join("|"));
+  return rows
+    .filter((row) => whereColumnIndex === null || row[whereColumnIndex] === whereValue)
+    .map((row) => columnIndexes.map((columnIndex) => row[columnIndex]).join("|"));
 }
 
 if (command === ".dbinfo") {
