@@ -163,17 +163,55 @@ function quoteIdentifier(identifier) {
 }
 
 function runSqliteQuery(sql) {
-  const output = execFileSync("sqlite3", [databaseFilePath, "-separator", "|", sql], { encoding: "utf8" });
+  const pythonScript = `
+import sqlite3
+import sys
 
-  if (!output.trim()) {
-    return [];
+conn = sqlite3.connect(sys.argv[1])
+try:
+    cursor = conn.execute(sys.argv[2])
+    rows = cursor.fetchall()
+    for row in rows:
+        values = []
+        for value in row:
+            if value is None:
+                values.append("")
+            else:
+                values.append(str(value))
+        sys.stdout.write("|".join(values) + "\\n")
+finally:
+    conn.close()
+`;
+
+  try {
+    const output = execFileSync("sqlite3", [databaseFilePath, "-separator", "|", sql], { encoding: "utf8" });
+
+    if (!output.trim()) {
+      return [];
+    }
+
+    return output
+      .trim()
+      .split(/\n/)
+      .filter(Boolean)
+      .map((row) => row.split("|"));
+  } catch (error) {
+    if (error.code !== "ENOENT" && error.code !== "ENOTFOUND") {
+      throw error;
+    }
+
+    const output = execFileSync("python3", ["-c", pythonScript, databaseFilePath, sql], { encoding: "utf8" });
+
+    if (!output.trim()) {
+      return [];
+    }
+
+    return output
+      .trim()
+      .split(/\n/)
+      .filter(Boolean)
+      .map((row) => row.split("|"));
   }
-
-  return output
-    .trim()
-    .split(/\n/)
-    .filter(Boolean)
-    .map((row) => row.split("|"));
 }
 
 function parseTables() {
