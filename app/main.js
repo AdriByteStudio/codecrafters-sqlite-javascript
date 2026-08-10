@@ -103,6 +103,37 @@ function getPageBuffer(databaseFileBuffer, pageNumber) {
   return { pageBuffer, pageSize };
 }
 
+function readCellPayload(databaseFileBuffer, pageBuffer, cellOffset, nextCellOffset = pageBuffer.length) {
+  const pageSize = databaseFileBuffer.readUInt16BE(16) || 65536;
+  const payloadSizeInfo = readVarint(pageBuffer, cellOffset);
+  const payloadSize = payloadSizeInfo.value;
+  const rowidInfo = readVarint(pageBuffer, payloadSizeInfo.offset);
+  const payloadStart = rowidInfo.offset;
+  const availableBytes = nextCellOffset - payloadStart;
+  const hasOverflow = payloadSize > availableBytes - 4;
+  const localPayloadSize = hasOverflow ? Math.max(0, availableBytes - 4) : Math.min(payloadSize, availableBytes);
+  let payload = pageBuffer.subarray(payloadStart, payloadStart + localPayloadSize);
+
+  if (payloadSize > localPayloadSize) {
+    const overflowPageNumber = pageBuffer.readUInt32BE(payloadStart + localPayloadSize);
+    const overflowChunks = [];
+    let remainingPayloadSize = payloadSize - localPayloadSize;
+    let nextOverflowPageNumber = overflowPageNumber;
+
+    while (nextOverflowPageNumber > 0 && remainingPayloadSize > 0) {
+      const overflowPageBuffer = getPageBuffer(databaseFileBuffer, nextOverflowPageNumber).pageBuffer;
+      const chunkLength = Math.min(remainingPayloadSize, pageSize - 4);
+      overflowChunks.push(overflowPageBuffer.subarray(4, 4 + chunkLength));
+      remainingPayloadSize -= chunkLength;
+      nextOverflowPageNumber = overflowPageBuffer.readUInt32BE(0);
+    }
+
+    payload = Buffer.concat([payload, ...overflowChunks]);
+  }
+
+  return payload;
+}
+
 function parseTables(databaseFileBuffer) {
   const { pageBuffer } = getPageBuffer(databaseFileBuffer, 1);
   const pageHeaderOffset = 100;
@@ -113,11 +144,7 @@ function parseTables(databaseFileBuffer) {
 
   for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
     const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
-    const payloadSizeInfo = readVarint(pageBuffer, cellOffset);
-    const rowidInfo = readVarint(pageBuffer, payloadSizeInfo.offset);
-    const payloadStart = rowidInfo.offset;
-    const payloadEnd = payloadStart + payloadSizeInfo.value;
-    const payload = pageBuffer.subarray(payloadStart, payloadEnd);
+    const payload = readCellPayload(databaseFileBuffer, pageBuffer, cellOffset);
     const values = decodeRecord(payload);
     const tableName = values[2] ?? values[1];
 
@@ -137,11 +164,7 @@ function getTableSchema(databaseFileBuffer, tableName) {
 
   for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
     const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
-    const payloadSizeInfo = readVarint(pageBuffer, cellOffset);
-    const rowidInfo = readVarint(pageBuffer, payloadSizeInfo.offset);
-    const payloadStart = rowidInfo.offset;
-    const payloadEnd = payloadStart + payloadSizeInfo.value;
-    const payload = pageBuffer.subarray(payloadStart, payloadEnd);
+    const payload = readCellPayload(databaseFileBuffer, pageBuffer, cellOffset);
     const values = decodeRecord(payload);
     const schemaTableName = values[2] ?? values[1];
 
@@ -199,32 +222,59 @@ function parseCreateTableColumns(createTableSql) {
     .filter(Boolean);
 }
 
-function countRowsInTable(databaseFileBuffer, rootPageNumber) {
-  const { pageBuffer } = getPageBuffer(databaseFileBuffer, rootPageNumber);
-  const pageHeaderOffset = rootPageNumber === 1 ? 100 : 0;
-  const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
-
-  return cellCount;
+function getBtreePageType(databaseFileBuffer, pageNumber) {
+  const { pageBuffer } = getPageBuffer(databaseFileBuffer, pageNumber);
+  const pageHeaderOffset = pageNumber === 1 ? 100 : 0;
+  return pageBuffer[pageHeaderOffset];
 }
 
-function readRowsFromTable(databaseFileBuffer, rootPageNumber) {
-  const { pageBuffer } = getPageBuffer(databaseFileBuffer, rootPageNumber);
-  const pageHeaderOffset = rootPageNumber === 1 ? 100 : 0;
-  const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
-  const cellPointerArrayOffset = pageHeaderOffset + 8;
-  const rows = [];
+function countRowsInTable(databaseFileBuffer, rootPageNumber) {
+  return readRowsFromTable(databaseFileBuffer, rootPageNumber).length;
+}
 
-  for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
-    const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
-    const payloadSizeInfo = readVarint(pageBuffer, cellOffset);
-    const rowidInfo = readVarint(pageBuffer, payloadSizeInfo.offset);
-    const payloadStart = rowidInfo.offset;
-    const payloadEnd = payloadStart + payloadSizeInfo.value;
-    const payload = pageBuffer.subarray(payloadStart, payloadEnd);
-    rows.push(decodeRecord(payload));
+function readRowsFromTable(databaseFileBuffer, pageNumber, rows = []) {
+  const { pageBuffer } = getPageBuffer(databaseFileBuffer, pageNumber);
+  const pageHeaderOffset = pageNumber === 1 ? 100 : 0;
+  const pageType = pageBuffer[pageHeaderOffset];
+
+  if (pageType === 0x0d) {
+    const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
+    const cellPointerArrayOffset = pageHeaderOffset + 8;
+    const cellOffsets = [];
+
+    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
+      cellOffsets.push(pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2));
+    }
+
+    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
+      const cellOffset = cellOffsets[cellIndex];
+      const nextCellOffset = cellIndex + 1 < cellOffsets.length ? cellOffsets[cellIndex + 1] : pageBuffer.length;
+      const payload = readCellPayload(databaseFileBuffer, pageBuffer, cellOffset, nextCellOffset);
+      rows.push(decodeRecord(payload));
+    }
+
+    return rows;
   }
 
-  return rows;
+  if (pageType === 0x05) {
+    const cellCount = pageBuffer.readUInt16BE(pageHeaderOffset + 3);
+    const cellPointerArrayOffset = pageHeaderOffset + 12;
+
+    for (let cellIndex = 0; cellIndex < cellCount; cellIndex++) {
+      const cellOffset = pageBuffer.readUInt16BE(cellPointerArrayOffset + cellIndex * 2);
+      const childPageNumber = pageBuffer.readUInt32BE(cellOffset);
+      readRowsFromTable(databaseFileBuffer, childPageNumber, rows);
+    }
+
+    const rightMostPageNumber = pageBuffer.readUInt32BE(pageHeaderOffset + 8);
+    if (rightMostPageNumber) {
+      readRowsFromTable(databaseFileBuffer, rightMostPageNumber, rows);
+    }
+
+    return rows;
+  }
+
+  throw new Error(`Unsupported b-tree page type: ${pageType}`);
 }
 
 function selectFromTable(databaseFileBuffer, query) {
